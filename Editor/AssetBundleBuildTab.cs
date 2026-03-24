@@ -77,18 +77,32 @@ namespace AssetBundleBrowser
             m_UserData.m_UseDefaultPath = true;
         }
 
-        internal void OnDisable()
+        /// <summary>
+        /// Saves the current build settings to disk.
+        /// </summary>
+        internal void SaveData()
         {
             var dataPath = System.IO.Path.GetFullPath(".");
             dataPath = dataPath.Replace("\\", "/");
             dataPath += "/Library/AssetBundleBrowserBuild.dat";
 
-            BinaryFormatter bf = new BinaryFormatter();
-            FileStream file = File.Create(dataPath);
+            try
+            {
+                BinaryFormatter bf = new BinaryFormatter();
+                using (FileStream file = File.Create(dataPath))
+                {
+                    bf.Serialize(file, m_UserData);
+                }
+            }
+            catch (System.Exception e)
+            {
+                Debug.LogWarning($"Failed to save build settings: {e.Message}");
+            }
+        }
 
-            bf.Serialize(file, m_UserData);
-            file.Close();
-
+        internal void OnDisable()
+        {
+            SaveData();
         }
         internal void OnEnable(EditorWindow parent)
         {
@@ -101,12 +115,31 @@ namespace AssetBundleBrowser
 
             if (File.Exists(dataPath))
             {
-                BinaryFormatter bf = new BinaryFormatter();
-                FileStream file = File.Open(dataPath, FileMode.Open);
-                var data = bf.Deserialize(file) as BuildTabData;
-                if (data != null)
-                    m_UserData = data;
-                file.Close();
+                try
+                {
+                    BinaryFormatter bf = new BinaryFormatter();
+                    using (FileStream file = File.Open(dataPath, FileMode.Open))
+                    {
+                        var data = bf.Deserialize(file) as BuildTabData;
+                        if (data != null)
+                        {
+                            m_UserData = data;
+                            // Ensure new fields have default values if they weren't serialized
+                            if (m_UserData.m_OnToggles == null)
+                                m_UserData.m_OnToggles = new List<string>();
+                            if (m_UserData.m_FileExtension == null)
+                                m_UserData.m_FileExtension = string.Empty;
+                            if (m_UserData.m_XORKey == null)
+                                m_UserData.m_XORKey = string.Empty;
+                        }
+                    }
+                }
+                catch (System.Exception e)
+                {
+                    Debug.LogWarning($"Failed to load build settings, using defaults: {e.Message}");
+                    m_UserData = new BuildTabData();
+                    m_UserData.m_OnToggles = new List<string>();
+                }
             }
             
             m_ToggleData = new List<ToggleData>();
@@ -211,6 +244,53 @@ namespace AssetBundleBrowser
                 EditorGUILayout.HelpBox(
                     "Building a single bundle may duplicate assets that are shared with other bundles. Use a full build for production output.",
                     MessageType.Warning);
+            }
+
+            // file extension
+            EditorGUILayout.Space();
+            using (new EditorGUI.DisabledScope(!AssetBundleModel.Model.DataSource.CanSpecifyBuildOutputDirectory))
+            {
+                string newExtension = EditorGUILayout.TextField(
+                    new GUIContent("File Extension", "Optional file extension to append to built AssetBundle files (e.g., '.bundle'). Leave empty for no extension."),
+                    m_UserData.m_FileExtension);
+                if (newExtension != m_UserData.m_FileExtension)
+                {
+                    // Ensure extension starts with '.' if not empty
+                    if (!string.IsNullOrEmpty(newExtension) && !newExtension.StartsWith("."))
+                        newExtension = "." + newExtension;
+                    m_UserData.m_FileExtension = newExtension;
+                }
+            }
+
+            // XOR encryption options
+            EditorGUILayout.Space();
+            using (new EditorGUI.DisabledScope(!AssetBundleModel.Model.DataSource.CanSpecifyBuildOutputDirectory))
+            {
+                bool newEnableEncrypt = EditorGUILayout.Toggle(
+                    new GUIContent("XOR Encryption", "Enable simple XOR encryption for built AssetBundles. Provides basic obfuscation, not secure encryption."),
+                    m_UserData.m_EnableXOREncryption);
+                if (newEnableEncrypt != m_UserData.m_EnableXOREncryption)
+                {
+                    m_UserData.m_EnableXOREncryption = newEnableEncrypt;
+                }
+
+                if (m_UserData.m_EnableXOREncryption)
+                {
+                    EditorGUI.indentLevel++;
+                    string newKey = EditorGUILayout.TextField(
+                        new GUIContent("XOR Key", "The key used for XOR encryption/decryption. Must not be empty."),
+                        m_UserData.m_XORKey);
+                    if (newKey != m_UserData.m_XORKey)
+                    {
+                        m_UserData.m_XORKey = newKey;
+                    }
+
+                    if (string.IsNullOrEmpty(m_UserData.m_XORKey))
+                    {
+                        EditorGUILayout.HelpBox("XOR Key cannot be empty when encryption is enabled.", MessageType.Warning);
+                    }
+                    EditorGUI.indentLevel--;
+                }
             }
 
             ////output path
@@ -418,6 +498,21 @@ namespace AssetBundleBrowser
 
             if(m_CopyToStreaming.state)
                 DirectoryCopy(m_UserData.m_OutputPath, m_streamingPath);
+
+            // Apply custom file extension if specified
+            if (!string.IsNullOrEmpty(m_UserData.m_FileExtension))
+            {
+                AppendFileExtension(m_UserData.m_OutputPath, m_UserData.m_FileExtension);
+            }
+
+            // Apply XOR encryption if enabled
+            if (m_UserData.m_EnableXOREncryption && !string.IsNullOrEmpty(m_UserData.m_XORKey))
+            {
+                XOREncryptBundles(m_UserData.m_OutputPath, m_UserData.m_XORKey);
+            }
+
+            // Save settings after build completes to preserve user data
+            SaveData();
         }
 
         private static void DirectoryCopy(string sourceDirName, string destDirName)
@@ -442,6 +537,80 @@ namespace AssetBundleBrowser
 
                 File.Copy(filePath, newFilePath, true);
             }
+        }
+
+        private static void AppendFileExtension(string outputDirectory, string extension)
+        {
+            if (!Directory.Exists(outputDirectory))
+                return;
+
+            // Get all files in the output directory (not manifest files)
+            var files = Directory.GetFiles(outputDirectory, "*", SearchOption.TopDirectoryOnly);
+            int renamedCount = 0;
+
+            foreach (string filePath in files)
+            {
+                string fileName = Path.GetFileName(filePath);
+                string fileExt = Path.GetExtension(filePath);
+
+                // Skip manifest files and files that already have the extension
+                if (fileName.EndsWith(".manifest"))
+                    continue;
+                if (fileExt.Equals(extension, System.StringComparison.OrdinalIgnoreCase))
+                    continue;
+                if (fileName.EndsWith(extension, System.StringComparison.OrdinalIgnoreCase))
+                    continue;
+
+                string newFilePath = filePath + extension;
+                if (File.Exists(newFilePath))
+                    File.Delete(newFilePath);
+
+                File.Move(filePath, newFilePath);
+                renamedCount++;
+            }
+
+            if (renamedCount > 0)
+                Debug.Log($"AssetBundle Build: Added '{extension}' extension to {renamedCount} bundle file(s).");
+        }
+
+        private static void XOREncryptBundles(string outputDirectory, string key)
+        {
+            if (!Directory.Exists(outputDirectory) || string.IsNullOrEmpty(key))
+                return;
+
+            var files = Directory.GetFiles(outputDirectory, "*", SearchOption.TopDirectoryOnly);
+            byte[] keyBytes = System.Text.Encoding.UTF8.GetBytes(key);
+            int encryptedCount = 0;
+
+            foreach (string filePath in files)
+            {
+                string fileName = Path.GetFileName(filePath);
+
+                // Skip manifest files
+                if (fileName.EndsWith(".manifest"))
+                    continue;
+
+                try
+                {
+                    byte[] fileBytes = File.ReadAllBytes(filePath);
+
+                    // Apply XOR encryption
+                    for (int i = 0; i < fileBytes.Length; i++)
+                    {
+                        fileBytes[i] ^= keyBytes[i % keyBytes.Length];
+                    }
+
+                    File.WriteAllBytes(filePath, fileBytes);
+                    encryptedCount++;
+                }
+                catch (System.Exception e)
+                {
+                    Debug.LogWarning($"AssetBundle Build: Failed to encrypt '{fileName}': {e.Message}");
+                }
+            }
+
+            if (encryptedCount > 0)
+                Debug.Log($"AssetBundle Build: XOR encrypted {encryptedCount} bundle file(s) with key '{key}'.");
         }
 
         private void BrowseForFolder()
@@ -506,12 +675,24 @@ namespace AssetBundleBrowser
         [System.Serializable]
         internal class BuildTabData
         {
+            [SerializeField]
             internal List<string> m_OnToggles;
+            [SerializeField]
             internal ValidBuildTarget m_BuildTarget = ValidBuildTarget.StandaloneWindows;
+            [SerializeField]
             internal CompressOptions m_Compression = CompressOptions.StandardCompression;
+            [SerializeField]
             internal string m_OutputPath = string.Empty;
+            [SerializeField]
             internal bool m_UseDefaultPath = true;
+            [SerializeField]
             internal int m_SelectedBundleIndex = 0; // 0 = All Bundles
+            [SerializeField]
+            internal string m_FileExtension = string.Empty; // Custom file extension for output bundles
+            [SerializeField]
+            internal bool m_EnableXOREncryption = false; // Enable XOR encryption
+            [SerializeField]
+            internal string m_XORKey = string.Empty; // XOR encryption key
         }
     }
 

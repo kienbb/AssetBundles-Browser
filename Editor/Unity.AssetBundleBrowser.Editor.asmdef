@@ -1,6 +1,7 @@
 {
     "name": "Unity.AssetBundleBrowser.Editor",
     "references": [
+        "Unity.AssetBundleBrowser.Runtime"
     ],
     "includePlatforms": [
         "Editor"

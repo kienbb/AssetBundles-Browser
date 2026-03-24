@@ -140,14 +140,46 @@ namespace AssetBundleBrowser
                 BrowseForFolder();
             }
 
+            GUILayout.FlexibleSpace();
+
+            // XOR decryption options
+            bool newEnableDecrypt = EditorGUILayout.ToggleLeft(
+                new GUIContent("Decrypt XOR", "Enable XOR decryption for encrypted bundles"),
+                m_Data.EnableXOREncryption,
+                GUILayout.MaxWidth(100f));
+            if (newEnableDecrypt != m_Data.EnableXOREncryption)
+            {
+                m_Data.EnableXOREncryption = newEnableDecrypt;
+            }
+
             GUILayout.EndHorizontal();
+
+            // XOR Key row
+            if (m_Data.EnableXOREncryption)
+            {
+                GUILayout.BeginHorizontal();
+                GUILayout.Space(10f);
+                GUILayout.Label("XOR Key:", GUILayout.MaxWidth(60f));
+                string newKey = EditorGUILayout.TextField(m_Data.XORKey);
+                if (newKey != m_Data.XORKey)
+                {
+                    m_Data.XORKey = newKey;
+                }
+                if (string.IsNullOrEmpty(m_Data.XORKey))
+                {
+                    GUILayout.Label(new GUIContent("!", "Key cannot be empty"), EditorStyles.helpBox, GUILayout.MaxWidth(20f));
+                }
+                GUILayout.EndHorizontal();
+            }
+
             EditorGUILayout.Space();
 
             if (m_BundleList.Count > 0)
             {
                 int halfWidth = (int)(m_Position.width / 2.0f);
-                m_BundleTreeView.OnGUI(new Rect(m_Position.x, m_Position.y + 30, halfWidth, m_Position.height - 30));
-                m_SingleInspector.OnGUI(new Rect(m_Position.x + halfWidth, m_Position.y + 30, halfWidth, m_Position.height - 30));
+                int topOffset = m_Data.EnableXOREncryption ? 54 : 30;
+                m_BundleTreeView.OnGUI(new Rect(m_Position.x, m_Position.y + topOffset, halfWidth, m_Position.height - topOffset));
+                m_SingleInspector.OnGUI(new Rect(m_Position.x + halfWidth, m_Position.y + topOffset, halfWidth, m_Position.height - topOffset));
             }
         }
 
@@ -347,9 +379,15 @@ namespace AssetBundleBrowser
             private List<string> m_BundlePaths = new List<string>();
             [SerializeField]
             private List<BundleFolderData> m_BundleFolders = new List<BundleFolderData>();
+            [SerializeField]
+            private bool m_EnableXOREncryption = false;
+            [SerializeField]
+            private string m_XORKey = string.Empty;
 
             internal IList<string> BundlePaths { get { return m_BundlePaths.AsReadOnly(); } }
             internal IList<BundleFolderData> BundleFolders { get { return m_BundleFolders.AsReadOnly(); } }
+            internal bool EnableXOREncryption { get { return m_EnableXOREncryption; } set { m_EnableXOREncryption = value; } }
+            internal string XORKey { get { return m_XORKey; } set { m_XORKey = value; } }
 
             internal void AddPath(string newPath)
             {
@@ -472,11 +510,20 @@ namespace AssetBundleBrowser
                     bundle = record.bundle;
                 }
             }
-                
+
             if (null == bundle)
             {
-                // Load the bundle
-                bundle = AssetBundle.LoadFromFile(path);
+                // Check if we need to decrypt the bundle
+                if (m_Data.EnableXOREncryption && !string.IsNullOrEmpty(m_Data.XORKey))
+                {
+                    bundle = LoadEncryptedBundle(path, m_Data.XORKey);
+                }
+                else
+                {
+                    // Load the bundle normally
+                    bundle = AssetBundle.LoadFromFile(path);
+                }
+
                 if (null == bundle)
                 {
                     return null;
@@ -493,6 +540,41 @@ namespace AssetBundleBrowser
             }
 
             return bundle;
+        }
+
+        /// <summary>
+        /// Loads an encrypted bundle by decrypting it in memory.
+        /// </summary>
+        /// <param name="path">Path to the encrypted bundle</param>
+        /// <param name="key">XOR decryption key</param>
+        /// <returns>The loaded bundle, or null if loading failed</returns>
+        private AssetBundle LoadEncryptedBundle(string path, string key)
+        {
+            try
+            {
+                byte[] encryptedData = File.ReadAllBytes(path);
+                byte[] decryptedData = AssetBundleXORRuntime.DecryptData(encryptedData, key);
+
+                if (decryptedData == null)
+                {
+                    Debug.LogWarning($"Failed to decrypt bundle: {path}");
+                    return null;
+                }
+
+                AssetBundle bundle = AssetBundle.LoadFromMemory(decryptedData);
+
+                if (bundle == null)
+                {
+                    Debug.LogWarning($"Failed to load decrypted bundle: {path}. The key may be incorrect.");
+                }
+
+                return bundle;
+            }
+            catch (System.Exception e)
+            {
+                Debug.LogError($"Error loading encrypted bundle '{path}': {e.Message}");
+                return null;
+            }
         }
 
         /// <summary>
